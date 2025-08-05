@@ -1,4 +1,4 @@
-
+import asyncio
 import streamlit as st
 import os
 import fitz  # PyMuPDF for fast PDF reading
