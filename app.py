@@ -6,18 +6,19 @@ import hashlib
 import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image
-import asyncio
 
 # --- LANGCHAIN IMPORTS ---
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.chains.question_answering import load_qa_chain  # ✅ FIXED IMPORT
+from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
 from langchain.docstore.document import Document
+import nest_asyncio
+nest_asyncio.apply()  # Fix event loop issue
 
 # --- STREAMLIT SETUP ---
-st.set_page_config(page_title="🇮🇳 AI Legal Assistant", layout="wide")
+st.set_page_config(page_title="AI Legal Assistant", layout="wide")
 st.title("🇮🇳 AI Legal Assistant for Indian Law")
 st.write("Ask a question about the Indian Constitution or IPC based on the uploaded documents.")
 
@@ -28,24 +29,10 @@ except (FileNotFoundError, KeyError):
     st.error("GOOGLE_API_KEY not found in secrets. Please create .streamlit/secrets.toml with your key.")
     st.stop()
 
-# --- Ensure event loop exists for Google Generative AI ---
+# --- Initialize models ---
 try:
-    asyncio.get_running_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-# --- Initialize models once ---
-try:
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=api_key
-    )
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash-latest",
-        temperature=0.3,
-        google_api_key=api_key
-    )
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key)
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.3, google_api_key=api_key)
 except Exception as e:
     st.error(f"Failed to initialize Google AI models. Please check your API key and network connection. Error: {e}")
     st.stop()
@@ -55,7 +42,7 @@ def process_pdf_page(args):
     """Processes a single page, performing OCR if needed."""
     pdf_path, page_num, fitz_doc = args
     page_text = fitz_doc[page_num].get_text()
-    if not page_text.strip():  # If no text, run OCR
+    if not page_text.strip():  # Likely scanned
         try:
             images = convert_from_path(pdf_path, first_page=page_num + 1, last_page=page_num + 1, dpi=300)
             if images:
@@ -66,7 +53,7 @@ def process_pdf_page(args):
     return page_text
 
 def process_single_pdf(pdf_file):
-    """Processes a full PDF file, using parallel page reading."""
+    """Processes one full PDF."""
     pdf_path = os.path.join("data", pdf_file)
     try:
         with fitz.open(pdf_path) as doc:
@@ -82,76 +69,78 @@ def process_single_pdf(pdf_file):
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
         chunks = splitter.split_text(full_text)
         return [Document(page_content=chunk, metadata={"source": pdf_file}) for chunk in chunks]
+
     except Exception as e:
         print(f"❌ Failed to process {pdf_file}: {e}")
         return []
 
+# --- HASH FUNCTION ---
 def get_data_hash():
-    """Generate a hash from all PDFs to detect changes."""
+    """Generate hash from PDFs to detect changes."""
     hash_md5 = hashlib.md5()
     data_dir = "data"
-    if not os.path.exists(data_dir): 
-        return ""
+    if not os.path.exists(data_dir): return ""
     pdf_files = sorted([f for f in os.listdir(data_dir) if f.endswith(".pdf")])
     for pdf_file in pdf_files:
         with open(os.path.join(data_dir, pdf_file), "rb") as f:
             hash_md5.update(f.read())
     return hash_md5.hexdigest()
 
+# --- LOAD OR CREATE KNOWLEDGE BASE ---
 @st.cache_resource
-def create_knowledge_base(_embeddings):
+def load_or_create_knowledge_base(_embeddings, force_refresh=False):
     data_dir = "data"
-    if not os.path.exists(data_dir) or not os.listdir(data_dir):
-        st.warning("The 'data' directory is empty or not found. Please add PDF files.")
-        return None
-
-    pdf_files = [f for f in os.listdir(data_dir) if f.endswith(".pdf")]
-    if not pdf_files:
-        st.warning("No PDF files found in the 'data' directory.")
-        return None
-
     index_path = "faiss_index"
-    current_hash = get_data_hash()
 
-    # Load from cache if no change
-    if os.path.exists(index_path) and os.path.exists("data_hash.txt"):
+    if not os.path.exists(data_dir):
+        st.warning("No 'data' folder found. Please create it and add PDF files.")
+        return None
+
+    # Load existing index if available
+    if not force_refresh and os.path.exists(index_path) and os.path.exists("data_hash.txt"):
         with open("data_hash.txt", "r") as f:
             old_hash = f.read().strip()
-        if old_hash == current_hash:
-            st.info("🔄 Loading cached knowledge base...")
+        if old_hash == get_data_hash():
+            st.info("🔄 Loading existing knowledge base...")
             return FAISS.load_local(index_path, _embeddings, allow_dangerous_deserialization=True)
 
     # Process PDFs
-    st.info(f"📚 Found {len(pdf_files)} PDFs. Processing...")
+    pdf_files = [f for f in os.listdir(data_dir) if f.endswith(".pdf")]
+    if not pdf_files:
+        st.warning("No PDF files found in 'data'.")
+        return None
+
+    st.info(f"📚 Processing {len(pdf_files)} PDFs...")
     all_chunks = []
-    with st.spinner("Processing documents..."):
+    with st.spinner("Extracting text..."):
         with ThreadPoolExecutor() as executor:
             results = executor.map(process_single_pdf, pdf_files)
             for chunks in results:
                 all_chunks.extend(chunks)
 
     if not all_chunks:
-        st.error("No text could be extracted from the PDFs.")
+        st.error("No text extracted from the PDFs.")
         return None
 
-    # Create FAISS vector store
     st.info(f"⚡ Generating embeddings for {len(all_chunks)} chunks...")
     vector_store = FAISS.from_documents(all_chunks, embedding=_embeddings)
     vector_store.save_local(index_path)
     with open("data_hash.txt", "w") as f:
-        f.write(current_hash)
-    st.success("✅ Knowledge base created successfully!")
+        f.write(get_data_hash())
+
+    st.success("✅ Knowledge base ready!")
     return vector_store
 
-# Build the knowledge base
-knowledge_base = create_knowledge_base(embeddings)
+# --- Force refresh button ---
+force_refresh = st.button("♻️ Rebuild Knowledge Base")
+knowledge_base = load_or_create_knowledge_base(embeddings, force_refresh)
 
 # --- QA CHAIN ---
 def get_conversational_chain(_llm):
     prompt_template = """
-    You are a helpful AI legal assistant. Answer the user's question based on the provided legal context.
-    If relevant, cite section numbers or articles. 
-    If not found in context, say: "The answer is not available in the provided documents."
+    You are a helpful AI legal assistant. Your task is to answer the user's question based on the provided legal context.
+    Provide a detailed and structured answer. If the context contains specific section numbers or articles, cite them.
+    If the answer is not in the provided context, state that "the answer is not available in the provided documents."
 
     CONTEXT:
     {context}
