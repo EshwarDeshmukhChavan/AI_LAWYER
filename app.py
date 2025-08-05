@@ -19,7 +19,7 @@ nest_asyncio.apply()  # Fix event loop issue
 
 # --- STREAMLIT SETUP ---
 st.set_page_config(page_title="AI Legal Assistant", layout="wide")
-st.title("🇮🇳 AI Legal Assistant for Indian Law")
+st.title("AI Legal Assistant for Indian Law")
 st.write("Ask a question about the Indian Constitution or IPC based on the uploaded documents.")
 
 # --- API KEY ---
